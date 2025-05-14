@@ -17,7 +17,7 @@ from pydantic import BaseModel
 
 # Configure logging
 def setup_logging(verbose: bool = False):
-    level = logging.DEBUG # if verbose else logging.INFO
+    level = logging.DEBUG  if verbose else logging.INFO
     format_str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     if verbose:
         format_str = "%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s"

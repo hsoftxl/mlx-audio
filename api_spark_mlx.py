@@ -12,6 +12,9 @@ import sys
 import numpy as np
 import soundfile as sf
 from fastrtc import ReplyOnPause, Stream, get_stt_model
+import threading # Add threading import
+import mlx.core as mx # Add mlx.core import
+import gc # Add gc import
 
 from pydantic import BaseModel
 
@@ -35,6 +38,7 @@ logger = setup_logging()  # Will be updated with verbose setting in main()
 tts_model = None  # Will be loaded when the server starts
 audio_player = None  # Will be initialized when the server starts
 stt_model = get_stt_model()
+tts_model_lock = threading.Lock() # Initialize the lock
 
 app = FastAPI()
 
@@ -56,106 +60,129 @@ class TTSRequest(BaseModel):
     speed: float = 1.0
     model: str = "mlx-community/Spark-TTS-0.5B-fp16"
 
-@app.post("/tts")
-def tts_endpoint(request: TTSRequest):
-    """
-    POST an x-www-form-urlencoded form with 'text' (and optional 'voice', 'speed', and 'model').
-    We run TTS on the text, save the audio in a unique file,
-    and return JSON with the filename so the client can retrieve it.
-    """
+async def _generate_tts_audio(text: str, voice: str, speed: float, model_name: str):
+    """Helper function to handle TTS generation, model loading/unloading, and file saving."""
     global tts_model
 
-    if not request.text.strip():
+    if not text.strip():
         return JSONResponse({"error": "Text is empty"}, status_code=400)
 
-    # Validate speed parameter
-    if not (0.5 <= request.speed <= 2.0):
+    if not (0.5 <= speed <= 2.0):
         return JSONResponse(
             {"error": "Speed must be between 0.5 and 2.0"}, status_code=400
         )
-    speed_float = request.speed
 
-    # Store current model repo_id for comparison
-    current_model_repo_id = (
-        getattr(tts_model, "repo_id", None) if tts_model is not None else None
-    )
-
-    # Load the model if it's not loaded or if a different model is requested
-    if tts_model is None or current_model_repo_id != request.model:
-        try:
-            logger.debug(f"Loading TTS model from {request.model}")
-            tts_model = load_model(request.model)
-            logger.debug("TTS model loaded successfully")
-        except Exception as e:
-            logger.error(f"Error loading TTS model: {str(e)}")
-            return JSONResponse(
-                {"error": f"Failed to load model: {str(e)}"}, status_code=500
-            )
-
-    # Generate the unique filename
     unique_id = str(uuid.uuid4())
     filename = f"tts_{unique_id}.wav"
     output_path = os.path.join(OUTPUT_FOLDER, filename)
 
-    logger.debug(
-        f"Generating TTS for text: '{request.text[:50]}...' with voice: {request.voice}, speed: {speed_float}, model: {request.model}"
-    )
-    logger.debug(f"Output file will be: {output_path}")
+    with tts_model_lock:
+        if tts_model is not None:
+            logger.debug(f"Unloading existing TTS model: {getattr(tts_model, 'repo_id', 'unknown')} to ensure fresh instance for every request.")
+            old_model_to_remove = tts_model
+            tts_model = None 
+            del old_model_to_remove
+            mx.clear_cache()
+            logger.debug("MLX cache cleared during aggressive model unload.")
+            gc.collect()
+            mx.synchronize()
+            logger.debug("Old TTS model presumed unloaded and GPU synchronized after cache clear and GC.")
 
-    # We'll use the high-level "model.generate" method:
-    results = tts_model.generate(
-        text=request.text,
-        voice=request.voice,
-        speed=speed_float, # Use the validated speed_float from the request
-        lang_code=request.voice[0] if request.voice and len(request.voice) > 0 else "z", # Basic lang_code extraction
-        sample_rate=16000,
-        pitch=1,
-        verbose=False,
-    )
-
-    # We'll just gather all segments (if any) into a single wav
-    # It's typical for multi-segment text to produce multiple wave segments:
-    audio_arrays = []
-    for segment in results:
-        audio_arrays.append(segment.audio)
-
-    # If no segments, return error
-    if not audio_arrays:
-        logger.error("No audio segments generated")
-        return JSONResponse({"error": "No audio generated"}, status_code=500)
-
-    # Concatenate all segments
-    cat_audio = np.concatenate(audio_arrays, axis=0)
-
-    # Write the audio as a WAV
-    try:
-        sf.write(output_path, cat_audio, 16000)
-        logger.debug(f"Successfully wrote audio file to {output_path}")
-
-        # Verify the file exists
-        if not os.path.exists(output_path):
-            logger.error(f"File was not created at {output_path}")
+        try:
+            logger.debug(f"Loading TTS model from {model_name} for current request.")
+            loaded_model_instance = load_model(model_name)
+            tts_model = loaded_model_instance
+            logger.debug("TTS model loaded successfully for current request.")
+        except Exception as e:
+            logger.error(f"Error loading TTS model: {str(e)}")
+            tts_model = None
             return JSONResponse(
-                {"error": "Failed to create audio file"}, status_code=500
+                {"error": f"Failed to load model: {str(e)}"}, status_code=500
             )
+        
+        logger.debug(
+            f"Generating TTS for text: '{text[:50]}...' with voice: {voice}, speed: {speed}, model: {model_name}"
+        )
+        logger.debug(f"Output file will be: {output_path}")
 
-        # Check file size
-        file_size = os.path.getsize(output_path)
-        logger.debug(f"File size: {file_size} bytes")
-
-        if file_size == 0:
-            logger.error("File was created but is empty")
-            return JSONResponse(
-                {"error": "Generated audio file is empty"}, status_code=500
-            )
-
-    except Exception as e:
-        logger.error(f"Error writing audio file: {str(e)}")
-        return JSONResponse(
-            {"error": f"Failed to save audio: {str(e)}"}, status_code=500
+        results = tts_model.generate(
+            text=text,
+            voice=voice,
+            speed=speed, 
+            lang_code=voice[0] if voice and len(voice) > 0 else "z",
+            sample_rate=16000,
+            pitch=1,
+            verbose=False
         )
 
-    return FileResponse(output_path, media_type="audio/wav", filename=output_path)
+           # ref_audio="1.wav",
+          #  ref_text="非要说的话,只能归结于理念不和吧",
+        evaluated_mlx_chunks = []
+        try:
+            for segment_obj in results:
+                chunk = segment_obj.audio
+                mx.eval(chunk)
+                evaluated_mlx_chunks.append(chunk)
+        finally:
+            if hasattr(results, 'close'):
+                results.close()
+            if 'results' in locals():
+                del results
+
+        if not evaluated_mlx_chunks:
+            logger.error("No audio segments generated")
+            gc.collect()
+            mx.synchronize()
+            return JSONResponse({"error": "No audio generated"}, status_code=500)
+
+        mx.synchronize() 
+        numpy_audio_segments = [np.array(chunk) for chunk in evaluated_mlx_chunks]
+        del evaluated_mlx_chunks
+        cat_audio = np.concatenate(numpy_audio_segments, axis=0)
+        del numpy_audio_segments
+        gc.collect() 
+        mx.synchronize()
+
+        try:
+            sf.write(output_path, cat_audio, 16000)
+            logger.debug(f"Successfully wrote audio file to {output_path}")
+            if not os.path.exists(output_path):
+                logger.error(f"File was not created at {output_path}")
+                if 'cat_audio' in locals(): del cat_audio
+                return JSONResponse({"error": "Failed to create audio file"}, status_code=500)
+            file_size = os.path.getsize(output_path)
+            logger.debug(f"File size: {file_size} bytes")
+            if file_size == 0:
+                logger.error("File was created but is empty")
+                if 'cat_audio' in locals(): del cat_audio
+                return JSONResponse({"error": "Generated audio file is empty"}, status_code=500)
+        except Exception as e:
+            logger.error(f"Error writing audio file: {str(e)}")
+            if 'cat_audio' in locals(): del cat_audio
+            return JSONResponse({"error": f"Failed to save audio: {str(e)}"}, status_code=500)
+        finally:
+            if 'cat_audio' in locals(): del cat_audio
+
+    return FileResponse(output_path, media_type="audio/wav", filename=filename)
+
+@app.post("/tts")
+async def tts_endpoint(request: TTSRequest):
+    """
+    POST endpoint for TTS, calls the shared generation logic.
+    """
+    return await _generate_tts_audio(request.text, request.voice, request.speed, request.model)
+
+@app.get("/tts")
+async def tts_get_endpoint(
+    text: str = Query(..., description="The text to synthesize."),
+    voice: str = Query("af_heart", description="Voice to use for synthesis."),
+    speed: float = Query(1.0, ge=0.5, le=2.0, description="Speed of the speech (0.5 to 2.0)."),
+    model: str = Query("mlx-community/Spark-TTS-0.5B-fp16", description="TTS model to use.")
+):
+    """
+    GET endpoint for TTS, calls the shared generation logic.
+    """
+    return await _generate_tts_audio(text, voice, speed, model)
 
 
 if __name__ == "__main__":
